@@ -21,6 +21,10 @@ export class SceneManager {
     this.onHoverCallback = null;
     this.onClickCallback = null;
     this.clock = new THREE.Clock();
+    this._sharedPipeColor = new THREE.Color();
+    this._sharedHeatColor = new THREE.Color();
+    this._pendingVisualUpdates = [];
+    this._rafScheduled = false;
 
     this._init();
     this._createLighting();
@@ -386,6 +390,8 @@ export class SceneManager {
   createPipe(start, end, id, pipeIndex, radius = 0.22, sensorData = null) {
     const group = new THREE.Group();
     group.userData.sensorNode = sensorData || { nodeId: id, nodeName: id, pipeIndex };
+    group.userData._heatTargets = [];
+    group.userData._lastAppliedTemp = -1;
 
     const startVec = new THREE.Vector3(...(Array.isArray(start) ? start : [start.x, start.y, start.z]));
     const endVec = new THREE.Vector3(...(Array.isArray(end) ? end : [end.x, end.y, end.z]));
@@ -405,6 +411,7 @@ export class SceneManager {
     pipe.castShadow = true;
     pipe.receiveShadow = true;
     group.add(pipe);
+    group.userData._heatTargets.push(pipeMat);
 
     group.position.copy(midPoint);
     const axis = new THREE.Vector3(0, 1, 0);
@@ -420,7 +427,7 @@ export class SceneManager {
     });
     const flange1 = new THREE.Mesh(flangeGeo, flangeMat);
     flange1.castShadow = true;
-    const flange2 = flange1.clone();
+    const flange2 = new THREE.Mesh(flangeGeo, flangeMat.clone());
     const f1Pos = startVec.clone().add(dirNorm.clone().multiplyScalar(radius * 0.3));
     const f2Pos = endVec.clone().sub(dirNorm.clone().multiplyScalar(radius * 0.3));
     const localF1 = group.worldToLocal(f1Pos.clone());
@@ -429,23 +436,7 @@ export class SceneManager {
     flange2.position.copy(localF2);
     group.add(flange1);
     group.add(flange2);
-
-    for (let i = 0; i < 6; i++) {
-      const boltAngle = (i / 6) * Math.PI * 2;
-      const boltGeo = new THREE.CylinderGeometry(0.025, 0.025, 0.14, 8);
-      const boltMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.9, roughness: 0.2 });
-      const boltPos = new THREE.Vector3(
-        Math.cos(boltAngle) * radius * 1.2,
-        0,
-        Math.sin(boltAngle) * radius * 1.2
-      );
-      [flange1, flange2].forEach((f, fi) => {
-        const bolt = new THREE.Mesh(boltGeo, boltMat);
-        bolt.position.copy(boltPos);
-        bolt.rotation.x = Math.PI / 2;
-        f.add(bolt);
-      });
-    }
+    group.userData._heatTargets.push(flangeMat, flange2.material);
 
     const glowGeo = new THREE.TorusGeometry(radius * 1.1, 0.02, 8, 24);
     const glowMat = new THREE.MeshBasicMaterial({
@@ -456,6 +447,7 @@ export class SceneManager {
     const glowRing = new THREE.Mesh(glowGeo, glowMat);
     glowRing.position.y = length * 0.25;
     group.userData.glowRing = glowRing;
+    group.userData._glowMat = glowMat;
     group.add(glowRing);
 
     this.pipeMeshes.set(id, group);
@@ -545,14 +537,15 @@ export class SceneManager {
 
   updatePipeColors(sensorNodes) {
     const nodesByPipeIndex = new Map();
-    sensorNodes.forEach(node => {
-      if (node.pipeIndex != null) {
-        if (!nodesByPipeIndex.has(node.pipeIndex)) {
-          nodesByPipeIndex.set(node.pipeIndex, []);
-        }
+    for (let i = 0; i < sensorNodes.length; i++) {
+      const node = sensorNodes[i];
+      if (node.pipeIndex != null && node.temperature != null) {
+        if (!nodesByPipeIndex.has(node.pipeIndex)) nodesByPipeIndex.set(node.pipeIndex, []);
         nodesByPipeIndex.get(node.pipeIndex).push(node);
       }
-    });
+    }
+
+    const TEMP_THRESHOLD = 0.8;
 
     this.pipeMeshes.forEach((group, pipeId) => {
       let temp = null;
@@ -566,104 +559,163 @@ export class SceneManager {
       }
 
       if (temp != null) {
-        const color = getHeatColor(temp);
-        this._applyHeatColorToGroup(group, color, temp);
-      }
-    });
-  }
-
-  _applyHeatColorToGroup(group, colorHex, temperature) {
-    const t = (temperature - 40) / (180 - 40);
-    const emissiveIntensity = 0.08 + t * 0.35;
-
-    group.traverse((child) => {
-      if (child.isMesh && child.material) {
-        const mats = Array.isArray(child.material) ? child.material : [child.material];
-        mats.forEach(mat => {
-          if (child.name === 'sensorMarker') return;
-          if (mat.color) {
-            const targetColor = new THREE.Color(colorHex);
-            mat.color.lerp(targetColor, 0.85);
-          }
-          if (mat.emissive && !mat.userData._origEmissive) {
-            const emissiveColor = new THREE.Color(colorHex);
-            mat.emissive.lerp(emissiveColor, 0.7);
-            mat.emissiveIntensity = emissiveIntensity;
-          }
-          if (mat.opacity !== undefined) {
-            if (group.userData.glowRing === child) {
-              mat.opacity = 0.1 + t * 0.5;
-              mat.color = new THREE.Color(colorHex);
-            }
-          }
-        });
-      }
-    });
-  }
-
-  updateBoilerTemperatures(sensorNodes) {
-    const boilers = sensorNodes.filter(n => n.nodeType === 'BOILER');
-    boilers.forEach(node => {
-      const group = this.boilerMeshes.get(node.nodeId);
-      if (group && node.temperature != null) {
-        const color = getHeatColor(node.temperature);
-        const t = (node.temperature - 40) / (180 - 40);
-        group.traverse((child) => {
-          if (child.isMesh && child.material && child.material.emissive) {
-            if (!child.material.userData._origEmissive) {
-              child.material.emissive = new THREE.Color(color);
-              child.material.emissiveIntensity = 0.05 + t * 0.3;
-            }
-          }
-        });
-        group.userData.sensorNode = node;
-      }
-    });
-  }
-
-  updateSensorMarkers(sensorNodes) {
-    sensorNodes.forEach(node => {
-      const group = this.nodeUserDataMap.get(node.nodeId);
-      if (!group) return;
-      group.userData.sensorNode = node;
-
-      const temp = node.temperature;
-      if (temp != null) {
-        const color = getHeatColor(temp);
-        group.traverse((child) => {
-          if (child.name === 'sensorMarker' && child.material) {
-            child.material.color = new THREE.Color(color);
-            child.material.emissive = new THREE.Color(color);
-            child.material.emissiveIntensity = 0.4 + ((temp - 40) / 140) * 0.4;
-          }
-          if (child.material && child.material.color && child.geometry && child.geometry.type === 'RingGeometry') {
-            child.material.color = new THREE.Color(color);
-            child.material.opacity = 0.3 + ((temp - 40) / 140) * 0.5;
-          }
-        });
-      }
-    });
-  }
-
-  updateValveStatus(sensorNodes) {
-    const valves = sensorNodes.filter(n => n.nodeType === 'VALVE');
-    valves.forEach(node => {
-      const group = this.valveMeshes.get(node.nodeId);
-      if (group) {
-        group.userData.sensorNode = node;
-        if (node.temperature != null) {
-          const color = getHeatColor(node.temperature);
-          group.traverse((child) => {
-            if (child.isMesh && child.material && child.material.color && child.material.emissive !== undefined) {
-              if (!child.material.userData._origEmissive) {
-                child.material.emissive = new THREE.Color(color);
-                child.material.emissiveIntensity = 0.1;
-              }
-            }
-          });
+        const last = group.userData._lastAppliedTemp;
+        if (last === -1 || Math.abs(temp - last) >= TEMP_THRESHOLD) {
+          group.userData._lastAppliedTemp = temp;
+          this._scheduleVisualUpdate(() => this._applyPipeHeatColorFast(group, temp));
         }
       }
     });
+  }
+
+  _applyPipeHeatColorFast(group, temperature) {
+    const t = Math.max(0, Math.min(1, (temperature - 40) / (180 - 40)));
+    const colorHex = getHeatColor(temperature);
+    const targetColor = this._sharedPipeColor.set(colorHex);
+    const emissiveIntensity = 0.08 + t * 0.35;
+
+    const targets = group.userData._heatTargets || [];
+    for (let i = 0; i < targets.length; i++) {
+      const mat = targets[i];
+      if (!mat) continue;
+      if (mat.color) mat.color.lerp(targetColor, 0.85);
+      if (mat.emissive && !mat.userData._origEmissive) {
+        mat.emissive.lerp(targetColor, 0.7);
+        mat.emissiveIntensity = emissiveIntensity;
+      }
+      mat.needsUpdate = false;
+    }
+    const glowMat = group.userData._glowMat;
+    if (glowMat) {
+      glowMat.color.copy(targetColor);
+      glowMat.opacity = 0.1 + t * 0.5;
+    }
+  }
+
+  _scheduleVisualUpdate(fn) {
+    this._pendingVisualUpdates.push(fn);
+    if (!this._rafScheduled) {
+      this._rafScheduled = true;
+      requestAnimationFrame(() => this._flushVisualUpdates());
+    }
+  }
+
+  _flushVisualUpdates() {
+    this._rafScheduled = false;
+    const tasks = this._pendingVisualUpdates;
+    if (tasks.length === 0) return;
+    this._pendingVisualUpdates = [];
+    for (let i = 0; i < tasks.length; i++) {
+      try { tasks[i](); } catch (e) { console.error(e); }
+    }
+  }
+
+  updateBoilerTemperatures(sensorNodes) {
+    for (let i = 0; i < sensorNodes.length; i++) {
+      const node = sensorNodes[i];
+      if (node.nodeType !== 'BOILER' || node.temperature == null) continue;
+      const group = this.boilerMeshes.get(node.nodeId);
+      if (!group) continue;
+      group.userData.sensorNode = node;
+      const last = group.userData._lastAppliedTemp ?? -1;
+      if (Math.abs(node.temperature - last) < 0.8) continue;
+      group.userData._lastAppliedTemp = node.temperature;
+      const temp = node.temperature;
+      this._scheduleVisualUpdate(() => this._applyBoilerHeat(group, temp));
+    }
+  }
+
+  _applyBoilerHeat(group, temperature) {
+    const t = Math.max(0, Math.min(1, (temperature - 40) / (180 - 40)));
+    const colorHex = getHeatColor(temperature);
+    const c = this._sharedHeatColor.set(colorHex);
+    const intensity = 0.05 + t * 0.3;
+    if (!group.userData._bodyMats) {
+      const mats = [];
+      group.traverse((child) => {
+        if (child.isMesh && child.material && child.material.emissive && !child.material.userData._origEmissive) {
+          mats.push(Array.isArray(child.material) ? child.material : [child.material]);
+        }
+      });
+      group.userData._bodyMats = mats.flat();
+    }
+    const mats = group.userData._bodyMats || [];
+    for (let i = 0; i < mats.length; i++) {
+      mats[i].emissive.lerp(c, 0.7);
+      mats[i].emissiveIntensity = intensity;
+    }
+  }
+
+  updateSensorMarkers(sensorNodes) {
+    for (let i = 0; i < sensorNodes.length; i++) {
+      const node = sensorNodes[i];
+      const group = this.nodeUserDataMap.get(node.nodeId);
+      if (!group || node.temperature == null) continue;
+      group.userData.sensorNode = node;
+      const last = group.userData._lastAppliedTemp ?? -1;
+      if (Math.abs(node.temperature - last) < 1.0) continue;
+      group.userData._lastAppliedTemp = node.temperature;
+      const temp = node.temperature;
+      this._scheduleVisualUpdate(() => this._applyMarkerHeat(group, temp));
+    }
+  }
+
+  _applyMarkerHeat(group, temperature) {
+    if (!group.userData._refs) {
+      const refs = {};
+      group.traverse((child) => {
+        if (child.name === 'sensorMarker') refs.marker = child;
+        if (child.geometry && child.geometry.type === 'RingGeometry') refs.halo = child;
+      });
+      group.userData._refs = refs;
+    }
+    const { marker, halo } = group.userData._refs;
+    const colorHex = getHeatColor(temperature);
+    const c = this._sharedHeatColor.set(colorHex);
+    const t = Math.max(0, Math.min(1, (temperature - 40) / (180 - 40)));
+    if (marker && marker.material) {
+      marker.material.color.copy(c);
+      marker.material.emissive.copy(c);
+      marker.material.emissiveIntensity = 0.4 + t * 0.4;
+    }
+    if (halo && halo.material) {
+      halo.material.color.copy(c);
+      halo.material.opacity = 0.3 + t * 0.5;
+    }
+  }
+
+  updateValveStatus(sensorNodes) {
+    for (let i = 0; i < sensorNodes.length; i++) {
+      const node = sensorNodes[i];
+      if (node.nodeType !== 'VALVE' || node.temperature == null) continue;
+      const group = this.valveMeshes.get(node.nodeId);
+      if (!group) continue;
+      group.userData.sensorNode = node;
+      const last = group.userData._lastAppliedTemp ?? -1;
+      if (Math.abs(node.temperature - last) < 1.0) continue;
+      group.userData._lastAppliedTemp = node.temperature;
+      const temp = node.temperature;
+      this._scheduleVisualUpdate(() => this._applyValveHeat(group, temp));
+    }
+  }
+
+  _applyValveHeat(group, temperature) {
+    if (!group.userData._valveMats) {
+      const mats = [];
+      group.traverse((child) => {
+        if (child.isMesh && child.material && child.material.emissive !== undefined && !child.material.userData._origEmissive) {
+          mats.push(child.material);
+        }
+      });
+      group.userData._valveMats = mats;
+    }
+    const colorHex = getHeatColor(temperature);
+    const c = this._sharedHeatColor.set(colorHex);
+    const mats = group.userData._valveMats || [];
+    for (let i = 0; i < mats.length; i++) {
+      mats[i].emissive.lerp(c, 0.7);
+      mats[i].emissiveIntensity = 0.1;
+    }
   }
 
   setAutoRotate(enabled) {

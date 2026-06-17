@@ -1,5 +1,5 @@
 import { SceneManager } from './three/SceneManager.js';
-import { fetchAllSensors } from './api/client.js';
+import { fetchAllSensors, cancelPendingRequest } from './api/client.js';
 import { getHeatColor, TEMP_MIN, TEMP_MAX } from './utils/heatColor.js';
 
 const PIPE_DEFS = [
@@ -31,10 +31,18 @@ class App {
   constructor() {
     this.sceneManager = null;
     this.sensorData = [];
+    this.sensorDataById = new Map();
     this.pollInterval = 2000;
-    this.pollTimer = null;
+    this._pollTimer = null;
+    this._fetching = false;
+    this._failCount = 0;
     this.paused = false;
     this.alarms = [];
+    this._uiRafScheduled = false;
+    this._pendingSensorListData = null;
+    this._pendingAlarmData = null;
+    this._lastSensorListKey = '';
+    this._lastAlarmKey = '';
 
     this._init();
   }
@@ -46,9 +54,7 @@ class App {
     this._buildScene();
     this._bindUIEvents();
     this._setupTooltip();
-    this._startPolling();
-
-    setTimeout(() => this._fetchAndUpdate(), 300);
+    this._scheduleNextPoll(300);
   }
 
   _buildScene() {
@@ -82,10 +88,6 @@ class App {
       const val = parseInt(e.target.value, 10);
       if (val >= 500 && val <= 10000) {
         this.pollInterval = val;
-        if (!this.paused) {
-          this._stopPolling();
-          this._startPolling();
-        }
       }
     });
 
@@ -93,14 +95,15 @@ class App {
     pauseBtn.addEventListener('click', () => {
       this.paused = !this.paused;
       if (this.paused) {
-        this._stopPolling();
+        this._clearPollTimer();
+        cancelPendingRequest();
         pauseBtn.textContent = '▶ 继续更新';
         pauseBtn.classList.add('active');
       } else {
         pauseBtn.textContent = '⏸ 暂停更新';
         pauseBtn.classList.remove('active');
-        this._startPolling();
-        this._fetchAndUpdate();
+        this._failCount = 0;
+        this._scheduleNextPoll(100);
       }
     });
 
@@ -165,129 +168,202 @@ class App {
     return map[status] || status || '--';
   }
 
-  _startPolling() {
-    if (this.pollTimer) return;
-    this._fetchAndUpdate();
-    this.pollTimer = setInterval(() => {
-      if (!this.paused) this._fetchAndUpdate();
-    }, this.pollInterval);
-  }
-
-  _stopPolling() {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
+  _clearPollTimer() {
+    if (this._pollTimer) {
+      clearTimeout(this._pollTimer);
+      this._pollTimer = null;
     }
   }
 
+  _scheduleNextPoll(delayOverride) {
+    this._clearPollTimer();
+    if (this.paused) return;
+    let delay = delayOverride != null ? delayOverride : this.pollInterval;
+    if (this._failCount > 0) {
+      const backoff = Math.min(10000, 500 * Math.pow(2, this._failCount));
+      delay = Math.max(delay, backoff);
+    }
+    this._pollTimer = setTimeout(() => this._fetchAndUpdate(), delay);
+  }
+
   async _fetchAndUpdate() {
+    if (this._fetching || this.paused) {
+      this._scheduleNextPoll();
+      return;
+    }
+    this._fetching = true;
     try {
-      const response = await fetchAllSensors();
+      const response = await fetchAllSensors({ timeoutMs: 3000 });
       if (response && response.code === 200 && response.data) {
+        this._failCount = 0;
         this.sensorData = response.data;
+        this.sensorDataById = new Map(response.data.map(n => [n.nodeId, n]));
         this._updateScene(this.sensorData);
-        this._updateSensorList(this.sensorData);
-        this._updateAlarms(this.sensorData);
+        this._scheduleUIUpdate(this.sensorData);
         this._updateConnectionStatus(true, response.timestamp);
+      } else {
+        throw new Error('Bad response');
       }
     } catch (err) {
-      console.warn('Poll failed:', err);
-      this._updateConnectionStatus(false, Date.now());
+      if (!err._aborted) {
+        this._failCount = Math.min(this._failCount + 1, 8);
+        console.warn(`Poll failed (fail=${this._failCount}):`, err.message || err.name);
+        this._updateConnectionStatus(false, Date.now());
+      }
+    } finally {
+      this._fetching = false;
+      this._scheduleNextPoll();
     }
   }
 
   _updateScene(sensorData) {
     this._assignTemperaturesToPipes(sensorData);
-    this.sceneManager.updatePipeColors(sensorData);
-    this.sceneManager.updateBoilerTemperatures(sensorData);
-    this.sceneManager.updateValveStatus(sensorData);
+    try {
+      this.sceneManager.updatePipeColors(sensorData);
+      this.sceneManager.updateBoilerTemperatures(sensorData);
+      this.sceneManager.updateValveStatus(sensorData);
+    } catch (e) {
+      console.error('Scene update error:', e);
+    }
 
-    sensorData.forEach(node => {
-      const pos = {
-        x: node.positionX ?? 0,
-        y: node.positionY ?? 0,
-        z: node.positionZ ?? 0,
-      };
+    for (let i = 0; i < sensorData.length; i++) {
+      const node = sensorData[i];
+      if (node.positionX == null) continue;
       if (!this.sceneManager.nodeUserDataMap.has(node.nodeId)) {
-        if (node.positionX != null) {
-          this.sceneManager.createSensorMarker(pos, node.nodeId, node);
-        }
+        try {
+          this.sceneManager.createSensorMarker(
+            { x: node.positionX, y: node.positionY, z: node.positionZ },
+            node.nodeId,
+            node
+          );
+        } catch (e) { /* noop */ }
       }
-    });
-    this.sceneManager.updateSensorMarkers(sensorData);
+    }
+    try {
+      this.sceneManager.updateSensorMarkers(sensorData);
+    } catch (e) {
+      console.error('Marker update error:', e);
+    }
   }
 
   _assignTemperaturesToPipes(sensorData) {
     const pipeGroups = new Map();
-    sensorData.forEach(node => {
+    for (let i = 0; i < sensorData.length; i++) {
+      const node = sensorData[i];
       if (node.pipeIndex != null && node.temperature != null) {
         const idx = node.pipeIndex;
         if (!pipeGroups.has(idx)) pipeGroups.set(idx, []);
         pipeGroups.get(idx).push(node);
       }
-    });
+    }
 
-    this.sceneManager.pipeMeshes.forEach((group, pipeId) => {
+    this.sceneManager.pipeMeshes.forEach((group) => {
       const pipeIdx = group.userData.sensorNode?.pipeIndex;
-      if (pipeIdx != null && pipeGroups.has(pipeIdx)) {
-        const nodes = pipeGroups.get(pipeIdx);
-        if (nodes.length > 0) {
-          const avgTemp = nodes.reduce((s, n) => s + n.temperature, 0) / nodes.length;
-          const avgPressure = nodes.reduce((s, n) => s + (n.pressure || 0), 0) / nodes.length;
-          const worstStatus = nodes.reduce((worst, n) => {
-            const rank = { NORMAL: 0, WARNING: 1, ALARM: 2 };
-            return rank[n.status] > rank[worst] ? n.status : worst;
-          }, 'NORMAL');
-          if (!group.userData.sensorNode) group.userData.sensorNode = {};
-          group.userData.sensorNode.temperature = avgTemp;
-          group.userData.sensorNode.pressure = avgPressure;
-          group.userData.sensorNode.status = worstStatus;
-          group.userData.sensorNode.nodeName = `管道#${pipeIdx}`;
-        }
+      if (pipeIdx == null || !pipeGroups.has(pipeIdx)) return;
+      const nodes = pipeGroups.get(pipeIdx);
+      if (!nodes.length) return;
+      let sumT = 0, sumP = 0;
+      let worst = 0;
+      const rank = { NORMAL: 0, WARNING: 1, ALARM: 2 };
+      for (let i = 0; i < nodes.length; i++) {
+        sumT += nodes[i].temperature;
+        sumP += (nodes[i].pressure || 0);
+        const r = rank[nodes[i].status] || 0;
+        if (r > worst) worst = r;
       }
+      const avgT = sumT / nodes.length;
+      const avgP = sumP / nodes.length;
+      const worstStatus = ['NORMAL', 'WARNING', 'ALARM'][worst];
+      if (!group.userData.sensorNode) group.userData.sensorNode = {};
+      group.userData.sensorNode.temperature = avgT;
+      group.userData.sensorNode.pressure = avgP;
+      group.userData.sensorNode.status = worstStatus;
+      group.userData.sensorNode.nodeName = `管道#${pipeIdx}`;
     });
   }
 
-  _updateSensorList(sensorData) {
+  _scheduleUIUpdate(sensorData) {
+    this._pendingSensorListData = sensorData;
+    const issues = sensorData.filter(n => n.status === 'WARNING' || n.status === 'ALARM');
+    this._pendingAlarmData = issues;
+    if (!this._uiRafScheduled) {
+      this._uiRafScheduled = true;
+      requestAnimationFrame(() => this._flushUIUpdates());
+    }
+  }
+
+  _flushUIUpdates() {
+    this._uiRafScheduled = false;
+    if (this._pendingSensorListData) {
+      const key = this._pendingSensorListData
+        .map(n => `${n.nodeId}|${n.status}|${n.temperature?.toFixed(0)}|${n.pressure?.toFixed(1)}`)
+        .sort()
+        .join(';');
+      if (key !== this._lastSensorListKey) {
+        this._lastSensorListKey = key;
+        try { this._renderSensorList(this._pendingSensorListData); } catch (e) { console.error(e); }
+      }
+      this._pendingSensorListData = null;
+    }
+    if (this._pendingAlarmData !== null) {
+      const key = this._pendingAlarmData
+        .map(n => `${n.nodeId}|${n.status}|${n.temperature?.toFixed(0)}`)
+        .join(';');
+      if (key !== this._lastAlarmKey) {
+        this._lastAlarmKey = key;
+        try { this._renderAlarms(this._pendingAlarmData); } catch (e) { console.error(e); }
+      }
+      this._pendingAlarmData = null;
+    }
+  }
+
+  _renderSensorList(sensorData) {
     const list = document.getElementById('sensor-list');
     if (!list) return;
     const items = sensorData.slice().sort((a, b) => {
       const rank = { NORMAL: 0, WARNING: 1, ALARM: 2 };
       return (rank[b.status] || 0) - (rank[a.status] || 0);
     });
-    list.innerHTML = items.map(n => {
+
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < items.length; i++) {
+      const n = items[i];
       const tempColor = getHeatColor(n.temperature ?? 80);
-      return `
-        <div class="sensor-item status-${n.status || 'NORMAL'}" data-node-id="${n.nodeId}">
-          <div class="sensor-name">
-            ${n.nodeName || n.nodeId}
-            <span class="sensor-badge badge-${n.status || 'NORMAL'}">${this._getStatusLabel(n.status)}</span>
-          </div>
-          <div class="sensor-metrics">
-            <span class="metric-temp">🌡 ${n.temperature?.toFixed(1) ?? '--'}°C</span>
-            <span class="metric-pressure">🔵 ${n.pressure?.toFixed(2) ?? '--'} MPa</span>
-          </div>
+      const div = document.createElement('div');
+      div.className = `sensor-item status-${n.status || 'NORMAL'}`;
+      div.dataset.nodeId = n.nodeId;
+      div.innerHTML = `
+        <div class="sensor-name">
+          ${n.nodeName || n.nodeId}
+          <span class="sensor-badge badge-${n.status || 'NORMAL'}">${this._getStatusLabel(n.status)}</span>
+        </div>
+        <div class="sensor-metrics">
+          <span class="metric-temp">🌡 ${n.temperature?.toFixed(1) ?? '--'}°C</span>
+          <span class="metric-pressure">🔵 ${n.pressure?.toFixed(2) ?? '--'} MPa</span>
         </div>
       `;
-    }).join('');
+      frag.appendChild(div);
+    }
 
-    list.querySelectorAll('.sensor-item').forEach(el => {
+    const sensorDataRef = sensorData;
+    frag.querySelectorAll('.sensor-item').forEach(el => {
       el.addEventListener('click', () => {
         const nodeId = el.dataset.nodeId;
-        const node = sensorData.find(n => n.nodeId === nodeId);
+        const node = sensorDataRef.find(n => n.nodeId === nodeId);
         if (node && node.positionX != null) {
           this._focusOnPosition(node.positionX, node.positionY, node.positionZ);
         }
       });
     });
+
+    list.replaceChildren(frag);
   }
 
-  _updateAlarms(sensorData) {
-    const issues = sensorData.filter(n => n.status === 'WARNING' || n.status === 'ALARM');
+  _renderAlarms(issues) {
     const list = document.getElementById('alarm-list');
     if (!list) return;
-    if (issues.length === 0) {
-      this.alarms = [];
+    this.alarms = issues || [];
+    if (!issues || issues.length === 0) {
       list.innerHTML = '<p class="no-alarm">暂无报警</p>';
       return;
     }
@@ -295,18 +371,22 @@ class App {
       const rank = { ALARM: 0, WARNING: 1 };
       return (rank[a.status] ?? 2) - (rank[b.status] ?? 2);
     });
-    list.innerHTML = issues.map(n => {
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < issues.length; i++) {
+      const n = issues[i];
       const ts = n.lastUpdated ? new Date(n.lastUpdated).toLocaleTimeString('zh-CN') : new Date().toLocaleTimeString('zh-CN');
       const msg = n.status === 'ALARM'
         ? `【报警】${n.nodeName || n.nodeId} 参数异常 (${n.temperature?.toFixed(1)}°C / ${n.pressure?.toFixed(2)}MPa)`
         : `【预警】${n.nodeName || n.nodeId} 参数接近阈值 (${n.temperature?.toFixed(1)}°C / ${n.pressure?.toFixed(2)}MPa)`;
-      return `
-        <div class="alarm-item level-${n.status}">
-          <div class="alarm-text">${msg}</div>
-          <div class="alarm-time">⏱ ${ts}</div>
-        </div>
+      const div = document.createElement('div');
+      div.className = `alarm-item level-${n.status}`;
+      div.innerHTML = `
+        <div class="alarm-text">${msg}</div>
+        <div class="alarm-time">⏱ ${ts}</div>
       `;
-    }).join('');
+      frag.appendChild(div);
+    }
+    list.replaceChildren(frag);
   }
 
   _updateConnectionStatus(ok, timestamp) {
@@ -349,4 +429,12 @@ class App {
 
 window.addEventListener('DOMContentLoaded', () => {
   window.__app = new App();
+});
+
+window.addEventListener('beforeunload', () => {
+  cancelPendingRequest();
+  if (window.__app) {
+    window.__app._clearPollTimer();
+    window.__app.paused = true;
+  }
 });
