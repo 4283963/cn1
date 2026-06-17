@@ -23,6 +23,8 @@ export class SceneManager {
     this.clock = new THREE.Clock();
     this._sharedPipeColor = new THREE.Color();
     this._sharedHeatColor = new THREE.Color();
+    this._sharedAlarmColor = new THREE.Color(0xff2a2a);
+    this._sharedWarnColor = new THREE.Color(0xffa500);
     this._pendingVisualUpdates = [];
     this._rafScheduled = false;
 
@@ -276,6 +278,25 @@ export class SceneManager {
       if (group.userData.glowRing) {
         group.userData.glowRing.rotation.x = time * 2;
       }
+      const alarmLevel = group.userData._alarmLevel;
+      const alarmMesh = group.userData._alarmMesh;
+      if (alarmMesh && alarmLevel) {
+        let speed = alarmLevel === 'ALARM' ? 6.0 : 2.5;
+        const pulse = (Math.sin(time * speed) + 1) * 0.5;
+        const intensity = 0.25 + pulse * 0.75;
+        alarmMesh.material.opacity = 0.15 + pulse * 0.55;
+        alarmMesh.material.emissiveIntensity = 0.4 + pulse * 1.1;
+        alarmMesh.scale.setScalar(1 + pulse * 0.08);
+        if (group.userData._heatTargets) {
+          const mats = group.userData._heatTargets;
+          for (let i = 0; i < mats.length; i++) {
+            if (mats[i].emissive) {
+              mats[i].emissive.lerp(this._sharedAlarmColor, 0.5 + pulse * 0.5);
+              mats[i].emissiveIntensity = 0.15 + pulse * 0.55;
+            }
+          }
+        }
+      }
     });
   }
 
@@ -449,6 +470,24 @@ export class SceneManager {
     group.userData.glowRing = glowRing;
     group.userData._glowMat = glowMat;
     group.add(glowRing);
+
+    const alarmGeo = new THREE.CylinderGeometry(radius * 1.45, radius * 1.45, length * 0.98, 18, 1, true);
+    const alarmMat = new THREE.MeshBasicMaterial({
+      color: 0xff2a2a,
+      transparent: true,
+      opacity: 0,
+      side: THREE.BackSide,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      emissive: 0xff2a2a,
+      emissiveIntensity: 0.5,
+    });
+    const alarmMesh = new THREE.Mesh(alarmGeo, alarmMat);
+    alarmMesh.visible = false;
+    alarmMesh.name = 'alarmShell';
+    group.add(alarmMesh);
+    group.userData._alarmMesh = alarmMesh;
+    group.userData._alarmLevel = null;
 
     this.pipeMeshes.set(id, group);
     this.scene.add(group);
@@ -728,6 +767,108 @@ export class SceneManager {
 
   setOnClickCallback(cb) {
     this.onClickCallback = cb;
+  }
+
+  updateAlarmStates(sensorNodes) {
+    const nodesByPipeIndex = new Map();
+    for (let i = 0; i < sensorNodes.length; i++) {
+      const node = sensorNodes[i];
+      if (node.pipeIndex != null) {
+        if (!nodesByPipeIndex.has(node.pipeIndex)) nodesByPipeIndex.set(node.pipeIndex, []);
+        nodesByPipeIndex.get(node.pipeIndex).push(node);
+      }
+    }
+
+    const rank = { NORMAL: 0, WARNING: 1, ALARM: 2 };
+    const pipeIndexWorst = new Map();
+    nodesByPipeIndex.forEach((nodes, idx) => {
+      let worst = 0;
+      let worstNode = null;
+      for (let i = 0; i < nodes.length; i++) {
+        const r = rank[nodes[i].status] || 0;
+        if (r > worst) { worst = r; worstNode = nodes[i]; }
+      }
+      pipeIndexWorst.set(idx, { status: ['NORMAL', 'WARNING', 'ALARM'][worst], node: worstNode });
+    });
+
+    this.pipeMeshes.forEach((group, pipeId) => {
+      const pipeIdx = group.userData.sensorNode?.pipeIndex;
+      let status = 'NORMAL';
+      const directNode = sensorNodes.find(n => n.nodeId === pipeId);
+      if (directNode) status = directNode.status || 'NORMAL';
+      if (pipeIdx != null && pipeIndexWorst.has(pipeIdx)) {
+        const w = pipeIndexWorst.get(pipeIdx).status;
+        if ((rank[w] || 0) > (rank[status] || 0)) status = w;
+      }
+
+      const alarmMesh = group.userData._alarmMesh;
+      if (!alarmMesh) return;
+
+      if (status === 'WARNING' || status === 'ALARM') {
+        group.userData._alarmLevel = status;
+        alarmMesh.visible = true;
+        const color = status === 'ALARM' ? this._sharedAlarmColor : this._sharedWarnColor;
+        alarmMesh.material.color.copy(color);
+        alarmMesh.material.emissive.copy(color);
+      } else {
+        group.userData._alarmLevel = null;
+        alarmMesh.visible = false;
+        alarmMesh.material.opacity = 0;
+      }
+    });
+  }
+
+  focusOnPipe(pipeId, sensorNode) {
+    const group = this.pipeMeshes.get(pipeId);
+    if (!group) {
+      if (sensorNode && sensorNode.positionX != null) {
+        this._animateCameraTo(sensorNode.positionX, sensorNode.positionY, sensorNode.positionZ);
+      }
+      return;
+    }
+
+    const worldPos = new THREE.Vector3();
+    group.getWorldPosition(worldPos);
+
+    const dir = new THREE.Vector3();
+    if (sensorNode && sensorNode.positionX != null) {
+      dir.set(sensorNode.positionX, sensorNode.positionY, sensorNode.positionZ).sub(worldPos);
+    }
+    if (dir.lengthSq() < 0.01) {
+      const camInit = new THREE.Vector3(10, 8, 12);
+      dir.copy(camInit);
+    }
+    dir.normalize();
+
+    const distance = 7;
+    const camTarget = worldPos.clone().add(dir.multiplyScalar(distance));
+    camTarget.y = Math.max(camTarget.y + 1.5, worldPos.y + 2);
+    this._animateCameraToPos(camTarget, worldPos);
+  }
+
+  _animateCameraTo(centerX, centerY, centerZ) {
+    const offset = new THREE.Vector3(5, 5, 7);
+    const endCam = new THREE.Vector3(centerX, centerY, centerZ).add(offset);
+    const endTarget = new THREE.Vector3(centerX, centerY, centerZ);
+    this._animateCameraToPos(endCam, endTarget);
+  }
+
+  _animateCameraToPos(endCamVec, endTargetVec) {
+    const cam = this.camera;
+    const target = this.controls.target;
+    const startCam = cam.position.clone();
+    const startTarget = target.clone();
+    const duration = 1000;
+    const startTime = performance.now();
+    const animate = () => {
+      const t = Math.min(1, (performance.now() - startTime) / duration);
+      const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      cam.position.lerpVectors(startCam, endCamVec, ease);
+      target.lerpVectors(startTarget, endTargetVec, ease);
+      this.controls.update();
+      if (t < 1) requestAnimationFrame(animate);
+    };
+    animate();
   }
 
   resetCamera() {

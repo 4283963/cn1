@@ -222,6 +222,7 @@ class App {
       this.sceneManager.updatePipeColors(sensorData);
       this.sceneManager.updateBoilerTemperatures(sensorData);
       this.sceneManager.updateValveStatus(sensorData);
+      this.sceneManager.updateAlarmStates(sensorData);
     } catch (e) {
       console.error('Scene update error:', e);
     }
@@ -364,29 +365,98 @@ class App {
     if (!list) return;
     this.alarms = issues || [];
     if (!issues || issues.length === 0) {
-      list.innerHTML = '<p class="no-alarm">暂无报警</p>';
+      list.innerHTML = '<p class="no-alarm">✅ 系统运行正常，无报警</p>';
       return;
     }
     issues.sort((a, b) => {
       const rank = { ALARM: 0, WARNING: 1 };
       return (rank[a.status] ?? 2) - (rank[b.status] ?? 2);
     });
+
+    const TEMP_WARN = 162;
+    const TEMP_ALARM = 171;
+    const PRESSURE_WARN = 2.7;
+    const PRESSURE_ALARM = 2.85;
+
     const frag = document.createDocumentFragment();
     for (let i = 0; i < issues.length; i++) {
       const n = issues[i];
       const ts = n.lastUpdated ? new Date(n.lastUpdated).toLocaleTimeString('zh-CN') : new Date().toLocaleTimeString('zh-CN');
-      const msg = n.status === 'ALARM'
-        ? `【报警】${n.nodeName || n.nodeId} 参数异常 (${n.temperature?.toFixed(1)}°C / ${n.pressure?.toFixed(2)}MPa)`
-        : `【预警】${n.nodeName || n.nodeId} 参数接近阈值 (${n.temperature?.toFixed(1)}°C / ${n.pressure?.toFixed(2)}MPa)`;
+      const tempVal = n.temperature;
+      const pressVal = n.pressure;
+
+      let tempThreshold = n.status === 'ALARM' ? TEMP_ALARM : TEMP_WARN;
+      let pressThreshold = n.status === 'ALARM' ? PRESSURE_ALARM : PRESSURE_WARN;
+      const tempOver = tempVal != null && tempVal > tempThreshold;
+      const pressOver = pressVal != null && pressVal > pressThreshold;
+
+      const tempOverPct = tempOver ? (((tempVal - tempThreshold) / tempThreshold) * 100).toFixed(1) : null;
+      const pressOverPct = pressOver ? (((pressVal - pressThreshold) / pressThreshold) * 100).toFixed(1) : null;
+
+      const icon = n.status === 'ALARM' ? '🚨' : '⚠️';
+      const label = n.status === 'ALARM' ? '报警' : '预警';
+
       const div = document.createElement('div');
       div.className = `alarm-item level-${n.status}`;
+      div.dataset.nodeId = n.nodeId;
+      if (n.pipeIndex != null) div.dataset.pipeIndex = String(n.pipeIndex);
+
       div.innerHTML = `
-        <div class="alarm-text">${msg}</div>
-        <div class="alarm-time">⏱ ${ts}</div>
+        <div class="alarm-head">
+          <span class="alarm-icon">${icon}</span>
+          <span class="alarm-title">${n.nodeName || n.nodeId}</span>
+          <button class="alarm-focus-btn" title="在 3D 场景中定位">🎯 定位</button>
+        </div>
+        <div class="alarm-metrics">
+          <span class="alarm-metric-temp ${tempOver ? 'over-limit' : ''}">
+            🌡 ${tempVal?.toFixed(1) ?? '--'}°C
+            ${tempOverPct != null ? `<span class="metric-overline">(阈值 ${tempThreshold}°C / +${tempOverPct}%)</span>` : ''}
+          </span>
+        </div>
+        <div class="alarm-metrics">
+          <span class="alarm-metric-pressure ${pressOver ? 'over-limit' : ''}">
+            🔵 ${pressVal?.toFixed(2) ?? '--'} MPa
+            ${pressOverPct != null ? `<span class="metric-overline">(阈值 ${pressThreshold}MPa / +${pressOverPct}%)</span>` : ''}
+          </span>
+        </div>
+        <div class="alarm-time">⏱ ${ts} · ${label}级别</div>
       `;
       frag.appendChild(div);
     }
+
+    const app = this;
+    frag.querySelectorAll('.alarm-item').forEach(el => {
+      const nodeId = el.dataset.nodeId;
+      const pipeIndex = el.dataset.pipeIndex != null ? parseInt(el.dataset.pipeIndex, 10) : null;
+      const focus = (e) => {
+        if (e) e.stopPropagation();
+        const node = issues.find(x => x.nodeId === nodeId);
+        const pipeId = app._findPipeIdByNodeIdOrIndex(nodeId, pipeIndex);
+        if (pipeId) {
+          app.sceneManager.focusOnPipe(pipeId, node);
+        } else if (node && node.positionX != null) {
+          app._focusOnPosition(node.positionX, node.positionY, node.positionZ);
+        }
+      };
+      el.addEventListener('click', focus);
+      const btn = el.querySelector('.alarm-focus-btn');
+      if (btn) btn.addEventListener('click', focus);
+    });
+
     list.replaceChildren(frag);
+  }
+
+  _findPipeIdByNodeIdOrIndex(nodeId, pipeIndex) {
+    const mgr = this.sceneManager;
+    if (mgr.pipeMeshes.has(nodeId)) return nodeId;
+    if (pipeIndex != null) {
+      for (const [pipeId, group] of mgr.pipeMeshes.entries()) {
+        if (group.userData.sensorNode?.pipeIndex === pipeIndex) {
+          return pipeId;
+        }
+      }
+    }
+    return null;
   }
 
   _updateConnectionStatus(ok, timestamp) {
