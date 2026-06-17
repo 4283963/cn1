@@ -1,0 +1,44 @@
+server:
+  port: 8080
+  servlet:
+    context-path: /api
+
+spring:
+  application:
+    name: boiler-monitor
+  datasource:
+    url: jdbc:h2:mem:boiler_db;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+    database-platform: org.hibernate.dialect.H2Dialect
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+      data-locations: classpath:data.sql
+
+app:
+  data-update-interval: 2000
+  temperature:
+    min: 40
+    max: 180
+  pressure:
+    min: 0.5
+    max: 3.0
+
+logging:
+  level:
+    com.boiler: DEBUG
+    org.hibernate.SQL: WARN

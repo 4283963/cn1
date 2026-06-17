@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>锅炉房三维状态监控系统</title>
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="header">
+      <h1>🏭 锅炉房三维状态监控系统</h1>
+      <div id="status-info">
+        <span>状态: <span id="conn-status" class="status-ok">已连接</span></span>
+        <span>更新时间: <span id="last-update">--</span></span>
+      </div>
+    </div>
+
+    <div id="main-container">
+      <div id="canvas-container"></div>
+
+      <div id="side-panel">
+        <div class="panel-section">
+          <h2>🌡️ 温度图例</h2>
+          <div id="legend-gradient"></div>
+          <div class="legend-labels">
+            <span>40°C (冷)</span>
+            <span>110°C</span>
+            <span>180°C (热)</span>
+          </div>
+        </div>
+
+        <div class="panel-section">
+          <h2>📊 传感器数据</h2>
+          <div id="sensor-list"></div>
+        </div>
+
+        <div class="panel-section">
+          <h2>⚙️ 控制面板</h2>
+          <div class="control-group">
+            <label>轮询间隔 (ms):</label>
+            <input type="number" id="poll-interval" value="2000" min="500" max="10000" step="500" />
+          </div>
+          <div class="control-group">
+            <button id="btn-pause">⏸ 暂停更新</button>
+            <button id="btn-rotate">🔄 自动旋转</button>
+          </div>
+        </div>
+
+        <div class="panel-section">
+          <h2>⚠️ 报警信息</h2>
+          <div id="alarm-list">
+            <p class="no-alarm">暂无报警</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tooltip" class="hidden"></div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
